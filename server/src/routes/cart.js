@@ -6,27 +6,46 @@ const { authMiddleware } = require('../middleware/auth');
 const router = express.Router();
 
 // @route   GET /api/cart
-// @desc    Get user's cart
+// @desc    Get user cart
 // @access  Private
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    let cart = await Cart.findOne({ user: req.userId })
-      .populate('items.product', 'name price images stock category');
-
+    let cart = await Cart.findOne({ user: req.userId }).populate('items.product');
+    
     if (!cart) {
-      cart = new Cart({ user: req.userId, items: [] });
+      cart = new Cart({
+        user: req.userId,
+        items: []
+      });
       await cart.save();
     }
 
+    // Calculate totals
+    const subtotal = cart.items.reduce((acc, item) => acc + (item.price * item.quantity), 0);
+    const tax = subtotal * 0.18; // 18% GST
+    const shipping = subtotal >= 500 ? 0 : 50;
+    const total = subtotal + tax + shipping;
+
+    const totals = {
+      subtotal,
+      tax: Math.round(tax * 100) / 100,
+      shipping,
+      discount: 0,
+      total: Math.round(total * 100) / 100
+    };
+
     res.json({
       success: true,
-      data: cart
+      data: {
+        ...cart.toObject(),
+        totals
+      }
     });
   } catch (error) {
-    console.error('Get cart error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching cart'
+      message: 'Server error'
     });
   }
 });
@@ -38,21 +57,8 @@ router.post('/add', authMiddleware, async (req, res) => {
   try {
     const { productId, quantity = 1 } = req.body;
 
-    if (!productId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Product ID is required'
-      });
-    }
-
-    if (quantity < 1 || quantity > 10) {
-      return res.status(400).json({
-        success: false,
-        message: 'Quantity must be between 1 and 10'
-      });
-    }
-
     const product = await Product.findById(productId);
+    
     if (!product || !product.isActive) {
       return res.status(404).json({
         success: false,
@@ -68,63 +74,42 @@ router.post('/add', authMiddleware, async (req, res) => {
     }
 
     let cart = await Cart.findOne({ user: req.userId });
+    
     if (!cart) {
-      cart = new Cart({ user: req.userId, items: [] });
+      cart = new Cart({
+        user: req.userId,
+        items: []
+      });
     }
 
     const existingItemIndex = cart.items.findIndex(
       item => item.product.toString() === productId
     );
 
-    const currentPrice = product.saleInfo?.isOnSale ? 
-      product.saleInfo.salePrice : product.price;
-
     if (existingItemIndex > -1) {
-      const newQuantity = cart.items[existingItemIndex].quantity + quantity;
-      
-      if (newQuantity > 10) {
-        return res.status(400).json({
-          success: false,
-          message: 'Maximum quantity per item is 10'
-        });
-      }
-
-      if (product.stock.quantity < newQuantity) {
-        return res.status(400).json({
-          success: false,
-          message: 'Insufficient stock'
-        });
-      }
-
-      cart.items[existingItemIndex].quantity = newQuantity;
-      cart.items[existingItemIndex].price = currentPrice;
+      // Update quantity if item already exists
+      cart.items[existingItemIndex].quantity += quantity;
     } else {
+      // Add new item
       cart.items.push({
         product: productId,
         quantity,
-        price: currentPrice
+        price: product.price
       });
     }
 
-    // Update product analytics
-    product.analytics.cartAdds += 1;
-    await product.save();
-
+    cart.lastUpdated = new Date();
     await cart.save();
 
-    const populatedCart = await Cart.findById(cart._id)
-      .populate('items.product', 'name price images stock category');
-
-    res.json({
+    res.status(201).json({
       success: true,
-      message: 'Item added to cart',
-      data: populatedCart
+      message: 'Item added to cart successfully'
     });
   } catch (error) {
-    console.error('Add to cart error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error adding item to cart'
+      message: 'Server error'
     });
   }
 });
@@ -136,21 +121,15 @@ router.put('/update', authMiddleware, async (req, res) => {
   try {
     const { productId, quantity } = req.body;
 
-    if (!productId) {
+    if (quantity < 1) {
       return res.status(400).json({
         success: false,
-        message: 'Product ID is required'
-      });
-    }
-
-    if (quantity < 0 || quantity > 10) {
-      return res.status(400).json({
-        success: false,
-        message: 'Quantity must be between 0 and 10'
+        message: 'Quantity must be at least 1'
       });
     }
 
     const cart = await Cart.findOne({ user: req.userId });
+    
     if (!cart) {
       return res.status(404).json({
         success: false,
@@ -158,57 +137,39 @@ router.put('/update', authMiddleware, async (req, res) => {
       });
     }
 
-    if (quantity === 0) {
-      cart.items = cart.items.filter(
-        item => item.product.toString() !== productId
-      );
-    } else {
-      const product = await Product.findById(productId);
-      if (!product || !product.isActive) {
-        return res.status(404).json({
-          success: false,
-          message: 'Product not found'
-        });
-      }
+    const itemIndex = cart.items.findIndex(
+      item => item.product.toString() === productId
+    );
 
-      if (product.stock.quantity < quantity) {
-        return res.status(400).json({
-          success: false,
-          message: 'Insufficient stock'
-        });
-      }
-
-      const itemIndex = cart.items.findIndex(
-        item => item.product.toString() === productId
-      );
-
-      if (itemIndex > -1) {
-        cart.items[itemIndex].quantity = quantity;
-        cart.items[itemIndex].price = product.saleInfo?.isOnSale ? 
-          product.saleInfo.salePrice : product.price;
-      } else {
-        return res.status(404).json({
-          success: false,
-          message: 'Item not found in cart'
-        });
-      }
+    if (itemIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        message: 'Item not found in cart'
+      });
     }
 
-    await cart.save();
+    // Check stock availability
+    const product = await Product.findById(productId);
+    if (product.stock.quantity < quantity) {
+      return res.status(400).json({
+        success: false,
+        message: 'Insufficient stock'
+      });
+    }
 
-    const populatedCart = await Cart.findById(cart._id)
-      .populate('items.product', 'name price images stock category');
+    cart.items[itemIndex].quantity = quantity;
+    cart.lastUpdated = new Date();
+    await cart.save();
 
     res.json({
       success: true,
-      message: 'Cart updated successfully',
-      data: populatedCart
+      message: 'Cart updated successfully'
     });
   } catch (error) {
-    console.error('Update cart error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error updating cart'
+      message: 'Server error'
     });
   }
 });
@@ -218,9 +179,8 @@ router.put('/update', authMiddleware, async (req, res) => {
 // @access  Private
 router.delete('/remove/:productId', authMiddleware, async (req, res) => {
   try {
-    const { productId } = req.params;
-
     const cart = await Cart.findOne({ user: req.userId });
+    
     if (!cart) {
       return res.status(404).json({
         success: false,
@@ -229,62 +189,44 @@ router.delete('/remove/:productId', authMiddleware, async (req, res) => {
     }
 
     cart.items = cart.items.filter(
-      item => item.product.toString() !== productId
+      item => item.product.toString() !== req.params.productId
     );
 
+    cart.lastUpdated = new Date();
     await cart.save();
-
-    const populatedCart = await Cart.findById(cart._id)
-      .populate('items.product', 'name price images stock category');
 
     res.json({
       success: true,
-      message: 'Item removed from cart',
-      data: populatedCart
+      message: 'Item removed from cart successfully'
     });
   } catch (error) {
-    console.error('Remove from cart error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error removing item from cart'
+      message: 'Server error'
     });
   }
 });
 
 // @route   DELETE /api/cart/clear
-// @desc    Clear entire cart
+// @desc    Clear cart
 // @access  Private
 router.delete('/clear', authMiddleware, async (req, res) => {
   try {
-    const cart = await Cart.findOne({ user: req.userId });
-    if (!cart) {
-      return res.status(404).json({
-        success: false,
-        message: 'Cart not found'
-      });
-    }
-
-    cart.items = [];
-    cart.totals = {
-      subtotal: 0,
-      tax: 0,
-      shipping: 0,
-      discount: 0,
-      total: 0
-    };
-
-    await cart.save();
+    await Cart.findOneAndUpdate(
+      { user: req.userId },
+      { items: [], lastUpdated: new Date() }
+    );
 
     res.json({
       success: true,
-      message: 'Cart cleared successfully',
-      data: cart
+      message: 'Cart cleared successfully'
     });
   } catch (error) {
-    console.error('Clear cart error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error clearing cart'
+      message: 'Server error'
     });
   }
 });
