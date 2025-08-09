@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:latest
+    container_name: neoshop-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password123
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - neoshop-network
+
+  server:
+    build: 
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: neoshop-server
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://admin:password123@mongodb:27017/neoshop?authSource=admin
+      JWT_SECRET: your-super-secret-jwt-key-here
+    depends_on:
+      - mongodb
+    networks:
+      - neoshop-network
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    container_name: neoshop-client
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - server
+    networks:
+      - neoshop-network
+
+volumes:
+  mongodb_data:
+
+networks:
+  neoshop-network:
+    driver: bridge
