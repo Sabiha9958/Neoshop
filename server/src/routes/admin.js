@@ -6,55 +6,49 @@ const { authMiddleware, adminMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Apply auth and admin middleware to all routes
-router.use(authMiddleware);
-router.use(adminMiddleware);
-
 // @route   GET /api/admin/dashboard
-// @desc    Get dashboard statistics
-// @access  Admin
-router.get('/dashboard', async (req, res) => {
+// @desc    Get admin dashboard stats
+// @access  Private (Admin only)
+router.get('/dashboard', [authMiddleware, adminMiddleware], async (req, res) => {
   try {
-    const [
-      totalUsers,
-      totalProducts,
-      totalOrders,
-      pendingOrders,
-      recentOrders,
-      topProducts,
-      lowStockProducts
-    ] = await Promise.all([
-      User.countDocuments({ role: 'user' }),
-      Product.countDocuments({ isActive: true }),
-      Order.countDocuments(),
-      Order.countDocuments({ status: 'pending' }),
-      Order.find().sort({ createdAt: -1 }).limit(5)
-        .populate('user', 'name email')
-        .populate('items.product', 'name'),
-      Product.find({ isActive: true })
-        .sort({ 'analytics.purchases': -1 })
-        .limit(5)
-        .select('name analytics.purchases price'),
-      Product.find({
-        isActive: true,
-        $expr: { $lte: ['$stock.quantity', '$stock.lowStockThreshold'] }
-      }).select('name stock.quantity stock.lowStockThreshold')
-    ]);
+    // Get basic stats
+    const totalUsers = await User.countDocuments({ role: 'user' });
+    const totalProducts = await Product.countDocuments({ isActive: true });
+    const totalOrders = await Order.countDocuments();
+    const pendingOrders = await Order.countDocuments({ status: 'pending' });
 
-    // Calculate revenue
-    const revenueData = await Order.aggregate([
-      { $match: { status: { $in: ['delivered', 'shipped'] } } },
+    // Get revenue
+    const revenueResult = await Order.aggregate([
+      { $match: { status: { $nin: ['cancelled'] } } },
       { $group: { _id: null, total: { $sum: '$totals.total' } } }
     ]);
+    const totalRevenue = revenueResult[0]?.total || 0;
 
-    const totalRevenue = revenueData[0]?.total || 0;
+    // Get low stock products
+    const lowStockProducts = await Product.find({
+      isActive: true,
+      $expr: { $lte: ['$stock.quantity', '$stock.lowStockThreshold'] }
+    }).select('name stock').limit(10);
 
-    // Monthly sales data
+    // Get recent orders
+    const recentOrders = await Order.find()
+      .populate('user', 'name email')
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .select('orderNumber user totals.total status createdAt');
+
+    // Get top selling products
+    const topProducts = await Product.find({ isActive: true })
+      .sort({ 'analytics.sold': -1 })
+      .limit(10)
+      .select('name analytics.sold');
+
+    // Get monthly sales data
     const monthlySales = await Order.aggregate([
       {
         $match: {
-          createdAt: { $gte: new Date(Date.now() - 12 * 30 * 24 * 60 * 60 * 1000) },
-          status: { $in: ['delivered', 'shipped'] }
+          status: { $nin: ['cancelled'] },
+          createdAt: { $gte: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000) }
         }
       },
       {
@@ -78,47 +72,52 @@ router.get('/dashboard', async (req, res) => {
           totalProducts,
           totalOrders,
           pendingOrders,
-          totalRevenue,
+          totalRevenue: Math.round(totalRevenue * 100) / 100,
           lowStockCount: lowStockProducts.length
         },
         recentOrders,
-        topProducts,
+        topProducts: topProducts.map(product => ({
+          id: product._id,
+          name: product.name,
+          sales: product.analytics.sold,
+          revenue: product.analytics.sold * product.price
+        })),
         lowStockProducts,
         monthlySales
       }
     });
   } catch (error) {
-    console.error('Admin dashboard error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching dashboard data'
+      message: 'Server error'
     });
   }
 });
 
 // @route   GET /api/admin/products
 // @desc    Get all products for admin
-// @access  Admin
-router.get('/products', async (req, res) => {
+// @access  Private (Admin only)
+router.get('/products', [authMiddleware, adminMiddleware], async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, category, status } = req.query;
+    const { page = 1, limit = 20, search, category, status = 'all' } = req.query;
 
     const filter = {};
+    if (status !== 'all') {
+      filter.isActive = status === 'active';
+    }
+    if (category) filter.category = category;
     if (search) {
       filter.$or = [
         { name: new RegExp(search, 'i') },
         { sku: new RegExp(search, 'i') }
       ];
     }
-    if (category) filter.category = category;
-    if (status === 'active') filter.isActive = true;
-    if (status === 'inactive') filter.isActive = false;
 
     const products = await Product.find(filter)
       .sort({ createdAt: -1 })
       .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .select('-reviews');
+      .skip((page - 1) * limit);
 
     const total = await Product.countDocuments(filter);
 
@@ -135,30 +134,24 @@ router.get('/products', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Admin get products error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching products'
+      message: 'Server error'
     });
   }
 });
 
 // @route   POST /api/admin/products
 // @desc    Create new product
-// @access  Admin
-router.post('/products', async (req, res) => {
+// @access  Private (Admin only)
+router.post('/products', [authMiddleware, adminMiddleware], async (req, res) => {
   try {
-    const productData = req.body;
-    
-    // Generate SKU if not provided
-    if (!productData.sku) {
-      const prefix = productData.category.substring(0, 3).toUpperCase();
-      const timestamp = Date.now().toString().slice(-6);
-      const random = Math.random().toString(36).substring(2, 5).toUpperCase();
-      productData.sku = `${prefix}-${timestamp}-${random}`;
-    }
+    const product = new Product({
+      ...req.body,
+      sku: req.body.sku || `PRD-${Date.now()}`
+    });
 
-    const product = new Product(productData);
     await product.save();
 
     res.status(201).json({
@@ -167,23 +160,23 @@ router.post('/products', async (req, res) => {
       data: product
     });
   } catch (error) {
-    console.error('Create product error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error creating product'
+      message: 'Server error'
     });
   }
 });
 
 // @route   PUT /api/admin/products/:id
 // @desc    Update product
-// @access  Admin
-router.put('/products/:id', async (req, res) => {
+// @access  Private (Admin only)
+router.put('/products/:id', [authMiddleware, adminMiddleware], async (req, res) => {
   try {
     const product = await Product.findByIdAndUpdate(
       req.params.id,
-      req.body,
-      { new: true, runValidators: true }
+      { ...req.body, updatedAt: new Date() },
+      { new: true }
     );
 
     if (!product) {
@@ -199,22 +192,22 @@ router.put('/products/:id', async (req, res) => {
       data: product
     });
   } catch (error) {
-    console.error('Update product error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error updating product'
+      message: 'Server error'
     });
   }
 });
 
 // @route   DELETE /api/admin/products/:id
-// @desc    Delete product
-// @access  Admin
-router.delete('/products/:id', async (req, res) => {
+// @desc    Delete product (soft delete)
+// @access  Private (Admin only)
+router.delete('/products/:id', [authMiddleware, adminMiddleware], async (req, res) => {
   try {
     const product = await Product.findByIdAndUpdate(
       req.params.id,
-      { isActive: false },
+      { isActive: false, updatedAt: new Date() },
       { new: true }
     );
 
@@ -230,18 +223,18 @@ router.delete('/products/:id', async (req, res) => {
       message: 'Product deleted successfully'
     });
   } catch (error) {
-    console.error('Delete product error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error deleting product'
+      message: 'Server error'
     });
   }
 });
 
 // @route   GET /api/admin/orders
 // @desc    Get all orders for admin
-// @access  Admin
-router.get('/orders', async (req, res) => {
+// @access  Private (Admin only)
+router.get('/orders', [authMiddleware, adminMiddleware], async (req, res) => {
   try {
     const { page = 1, limit = 20, status, search } = req.query;
 
@@ -249,16 +242,16 @@ router.get('/orders', async (req, res) => {
     if (status) filter.status = status;
     if (search) {
       filter.$or = [
-        { orderNumber: new RegExp(search, 'i') }
+        { orderNumber: new RegExp(search, 'i') },
+        { 'shipping.address.name': new RegExp(search, 'i') }
       ];
     }
 
     const orders = await Order.find(filter)
+      .populate('user', 'name email')
       .sort({ createdAt: -1 })
       .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .populate('user', 'name email')
-      .populate('items.product', 'name images');
+      .skip((page - 1) * limit);
 
     const total = await Order.countDocuments(filter);
 
@@ -275,22 +268,23 @@ router.get('/orders', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Admin get orders error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching orders'
+      message: 'Server error'
     });
   }
 });
 
 // @route   PUT /api/admin/orders/:id/status
 // @desc    Update order status
-// @access  Admin
-router.put('/orders/:id/status', async (req, res) => {
+// @access  Private (Admin only)
+router.put('/orders/:id/status', [authMiddleware, adminMiddleware], async (req, res) => {
   try {
     const { status, trackingNumber, notes } = req.body;
 
     const order = await Order.findById(req.params.id);
+    
     if (!order) {
       return res.status(404).json({
         success: false,
@@ -299,43 +293,42 @@ router.put('/orders/:id/status', async (req, res) => {
     }
 
     order.status = status;
+    
     if (trackingNumber) {
-      order.tracking.number = trackingNumber;
+      order.tracking = {
+        number: trackingNumber,
+        carrier: 'CyberExpress',
+        url: `https://tracking.example.com/${trackingNumber}`
+      };
     }
-    if (notes) {
-      order.notes.admin = notes;
-    }
+
+    order.timeline.push({
+      status,
+      timestamp: new Date(),
+      note: notes || `Order status updated to ${status}`
+    });
 
     await order.save();
 
-    // Emit real-time update
-    const io = req.app.get('io');
-    io.emit('order-update', {
-      orderId: order._id,
-      status: order.status,
-      orderNumber: order.orderNumber
-    });
-
     res.json({
       success: true,
-      message: 'Order status updated successfully',
-      data: order
+      message: 'Order status updated successfully'
     });
   } catch (error) {
-    console.error('Update order status error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error updating order status'
+      message: 'Server error'
     });
   }
 });
 
 // @route   GET /api/admin/users
-// @desc    Get all users
-// @access  Admin
-router.get('/users', async (req, res) => {
+// @desc    Get all users for admin
+// @access  Private (Admin only)
+router.get('/users', [authMiddleware, adminMiddleware], async (req, res) => {
   try {
-    const { page = 1, limit = 20, search, role } = req.query;
+    const { page = 1, limit = 20, search } = req.query;
 
     const filter = {};
     if (search) {
@@ -344,7 +337,6 @@ router.get('/users', async (req, res) => {
         { email: new RegExp(search, 'i') }
       ];
     }
-    if (role) filter.role = role;
 
     const users = await User.find(filter)
       .select('-password')
@@ -367,10 +359,10 @@ router.get('/users', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Admin get users error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching users'
+      message: 'Server error'
     });
   }
 });
