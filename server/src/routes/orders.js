@@ -2,29 +2,21 @@ const express = require('express');
 const Order = require('../models/Order');
 const Cart = require('../models/Cart');
 const Product = require('../models/Product');
-const { authMiddleware } = require('../middleware/auth');
-const { sendEmail } = require('../utils/email');
+const { authMiddleware, adminMiddleware } = require('../middleware/auth');
+const { generateOrderNumber } = require('../utils/helpers');
 
 const router = express.Router();
 
 // @route   POST /api/orders
-// @desc    Create new order
+// @desc    Create order from cart
 // @access  Private
 router.post('/', authMiddleware, async (req, res) => {
   try {
     const { shippingAddress, paymentMethod, paymentDetails } = req.body;
 
-    if (!shippingAddress || !paymentMethod) {
-      return res.status(400).json({
-        success: false,
-        message: 'Shipping address and payment method are required'
-      });
-    }
-
     // Get user's cart
-    const cart = await Cart.findOne({ user: req.userId })
-      .populate('items.product');
-
+    const cart = await Cart.findOne({ user: req.userId }).populate('items.product');
+    
     if (!cart || cart.items.length === 0) {
       return res.status(400).json({
         success: false,
@@ -42,83 +34,65 @@ router.post('/', authMiddleware, async (req, res) => {
       }
     }
 
-    // Create order items
-    const orderItems = cart.items.map(item => ({
-      product: item.product._id,
-      name: item.product.name,
-      image: item.product.images[0]?.url,
-      quantity: item.quantity,
-      price: item.price,
-      total: item.price * item.quantity,
-      sku: item.product.sku
-    }));
+    // Calculate totals
+    const subtotal = cart.items.reduce((acc, item) => acc + (item.price * item.quantity), 0);
+    const tax = subtotal * 0.18;
+    const shipping = subtotal >= 500 ? 0 : 50;
+    const total = subtotal + tax + shipping;
 
     // Create order
     const order = new Order({
       user: req.userId,
-      items: orderItems,
+      orderNumber: generateOrderNumber(),
+      items: cart.items.map(item => ({
+        product: item.product._id,
+        name: item.product.name,
+        image: item.product.images[0]?.url,
+        quantity: item.quantity,
+        price: item.price,
+        total: item.price * item.quantity,
+        sku: item.product.sku
+      })),
       shipping: {
         address: shippingAddress,
         method: 'standard',
-        cost: cart.totals.shipping,
+        cost: shipping,
         estimatedDelivery: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
       },
       payment: {
         method: paymentMethod,
-        status: 'pending'
+        status: 'completed',
+        transactionId: paymentDetails.transactionId,
+        paidAt: new Date()
       },
-      totals: cart.totals,
-      status: 'pending'
+      totals: {
+        subtotal,
+        tax: Math.round(tax * 100) / 100,
+        shipping,
+        discount: 0,
+        total: Math.round(total * 100) / 100
+      },
+      status: 'pending',
+      timeline: [{
+        status: 'pending',
+        timestamp: new Date(),
+        note: 'Order placed successfully'
+      }]
     });
 
     await order.save();
 
-    // Update product stock and analytics
+    // Update product stock
     for (const item of cart.items) {
-      await Product.findByIdAndUpdate(item.product._id, {
-        $inc: {
-          'stock.quantity': -item.quantity,
-          'analytics.purchases': item.quantity
-        }
-      });
+      await Product.findByIdAndUpdate(
+        item.product._id,
+        { $inc: { 'stock.quantity': -item.quantity, 'analytics.sold': item.quantity } }
+      );
     }
 
     // Clear cart
     cart.items = [];
-    cart.totals = {
-      subtotal: 0,
-      tax: 0,
-      shipping: 0,
-      discount: 0,
-      total: 0
-    };
     await cart.save();
-
-    // Send order confirmation email
-    try {
-      await sendEmail({
-        to: req.user.email,
-        subject: `Order Confirmation - ${order.orderNumber}`,
-        template: 'orderConfirmation',
-        data: {
-          orderNumber: order.orderNumber,
-          items: orderItems,
-          total: cart.totals.total,
-          customerName: req.user.name
-        }
-      });
-    } catch (emailError) {
-      console.log('Email sending failed:', emailError.message);
-    }
-
-    // Emit real-time notification to admin
-    const io = req.app.get('io');
-    io.to('admin').emit('new-order', {
-      orderId: order._id,
-      orderNumber: order.orderNumber,
-      customer: req.user.name,
-      total: order.totals.total
-    });
 
     res.status(201).json({
       success: true,
@@ -129,21 +103,21 @@ router.post('/', authMiddleware, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Create order error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error creating order'
+      message: 'Server error'
     });
   }
 });
 
 // @route   GET /api/orders
-// @desc    Get user's orders
+// @desc    Get user orders
 // @access  Private
 router.get('/', authMiddleware, async (req, res) => {
   try {
     const { page = 1, limit = 10, status } = req.query;
-
+    
     const filter = { user: req.userId };
     if (status) filter.status = status;
 
@@ -151,7 +125,7 @@ router.get('/', authMiddleware, async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit)
-      .populate('items.product', 'name images');
+      .select('-timeline');
 
     const total = await Order.countDocuments(filter);
 
@@ -168,23 +142,23 @@ router.get('/', authMiddleware, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Get orders error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching orders'
+      message: 'Server error'
     });
   }
 });
 
 // @route   GET /api/orders/:id
-// @desc    Get single order
+// @desc    Get order by ID
 // @access  Private
 router.get('/:id', authMiddleware, async (req, res) => {
   try {
     const order = await Order.findOne({
       _id: req.params.id,
       user: req.userId
-    }).populate('items.product', 'name images');
+    });
 
     if (!order) {
       return res.status(404).json({
@@ -198,10 +172,10 @@ router.get('/:id', authMiddleware, async (req, res) => {
       data: order
     });
   } catch (error) {
-    console.error('Get order error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching order'
+      message: 'Server error'
     });
   }
 });
@@ -212,7 +186,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
 router.put('/:id/cancel', authMiddleware, async (req, res) => {
   try {
     const { reason } = req.body;
-
+    
     const order = await Order.findOne({
       _id: req.params.id,
       user: req.userId
@@ -225,7 +199,7 @@ router.put('/:id/cancel', authMiddleware, async (req, res) => {
       });
     }
 
-    if (!['pending', 'confirmed'].includes(order.status)) {
+    if (['shipped', 'delivered', 'cancelled'].includes(order.status)) {
       return res.status(400).json({
         success: false,
         message: 'Order cannot be cancelled at this stage'
@@ -233,31 +207,31 @@ router.put('/:id/cancel', authMiddleware, async (req, res) => {
     }
 
     order.status = 'cancelled';
-    order.cancellation = {
-      reason: reason || 'Cancelled by customer',
-      cancelledBy: 'customer',
-      cancelledAt: new Date()
-    };
-
-    await order.save();
+    order.timeline.push({
+      status: 'cancelled',
+      timestamp: new Date(),
+      note: reason || 'Order cancelled by customer'
+    });
 
     // Restore product stock
     for (const item of order.items) {
-      await Product.findByIdAndUpdate(item.product, {
-        $inc: { 'stock.quantity': item.quantity }
-      });
+      await Product.findByIdAndUpdate(
+        item.product,
+        { $inc: { 'stock.quantity': item.quantity, 'analytics.sold': -item.quantity } }
+      );
     }
+
+    await order.save();
 
     res.json({
       success: true,
-      message: 'Order cancelled successfully',
-      data: order
+      message: 'Order cancelled successfully'
     });
   } catch (error) {
-    console.error('Cancel order error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error cancelling order'
+      message: 'Server error'
     });
   }
 });
