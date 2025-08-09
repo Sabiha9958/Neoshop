@@ -1,8 +1,14 @@
 const express = require('express');
 const Product = require('../models/Product');
 const { authMiddleware, adminMiddleware } = require('../middleware/auth');
+const multer = require('multer');
+const cloudinary = require('../utils/cloudinary');
 
 const router = express.Router();
+
+// Configure multer for file uploads
+const storage = multer.memoryStorage();
+const upload = multer({ storage });
 
 // @route   GET /api/products
 // @desc    Get all products with filtering and pagination
@@ -19,7 +25,9 @@ router.get('/', async (req, res) => {
       sortBy = 'createdAt',
       sortOrder = 'desc',
       featured,
-      brand
+      brand,
+      onSale,
+      inStock
     } = req.query;
 
     // Build filter object
@@ -27,6 +35,8 @@ router.get('/', async (req, res) => {
     
     if (category && category !== 'all') filter.category = category;
     if (featured === 'true') filter.isFeatured = true;
+    if (onSale === 'true') filter['saleInfo.isOnSale'] = true;
+    if (inStock === 'true') filter['stock.quantity'] = { $gt: 0 };
     if (brand) filter.brand = new RegExp(brand, 'i');
     
     if (minPrice || maxPrice) {
@@ -66,22 +76,21 @@ router.get('/', async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Get products error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching products'
+      message: 'Server error'
     });
   }
 });
 
 // @route   GET /api/products/:id
-// @desc    Get single product
+// @desc    Get product by ID
 // @access  Public
 router.get('/:id', async (req, res) => {
   try {
-    const product = await Product.findById(req.params.id)
-      .populate('reviews.user', 'name profile.avatar');
-
+    const product = await Product.findById(req.params.id).populate('reviews.user', 'name avatar');
+    
     if (!product || !product.isActive) {
       return res.status(404).json({
         success: false,
@@ -89,7 +98,7 @@ router.get('/:id', async (req, res) => {
       });
     }
 
-    // Increment view count
+    // Update view count
     product.analytics.views += 1;
     await product.save();
 
@@ -98,10 +107,16 @@ router.get('/:id', async (req, res) => {
       data: product
     });
   } catch (error) {
-    console.error('Get product error:', error);
+    console.error(error);
+    if (error.kind === 'ObjectId') {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
+    }
     res.status(500).json({
       success: false,
-      message: 'Error fetching product'
+      message: 'Server error'
     });
   }
 });
@@ -112,16 +127,9 @@ router.get('/:id', async (req, res) => {
 router.post('/:id/reviews', authMiddleware, async (req, res) => {
   try {
     const { rating, title, comment } = req.body;
-    
-    if (!rating || rating < 1 || rating > 5) {
-      return res.status(400).json({
-        success: false,
-        message: 'Rating must be between 1 and 5'
-      });
-    }
 
     const product = await Product.findById(req.params.id);
-
+    
     if (!product) {
       return res.status(404).json({
         success: false,
@@ -129,7 +137,7 @@ router.post('/:id/reviews', authMiddleware, async (req, res) => {
       });
     }
 
-    // Check if user already reviewed
+    // Check if user already reviewed this product
     const existingReview = product.reviews.find(
       review => review.user.toString() === req.userId
     );
@@ -141,54 +149,31 @@ router.post('/:id/reviews', authMiddleware, async (req, res) => {
       });
     }
 
-    // Add review
-    product.reviews.push({
+    const review = {
       user: req.userId,
-      rating,
+      rating: Number(rating),
       title,
-      comment
-    });
+      comment,
+      verified: false // Set to true if user has purchased the product
+    };
 
+    product.reviews.push(review);
+    
     // Update average rating
-    const totalRating = product.reviews.reduce((sum, review) => sum + review.rating, 0);
-    product.rating.average = totalRating / product.reviews.length;
     product.rating.count = product.reviews.length;
+    product.rating.average = product.reviews.reduce((acc, item) => item.rating + acc, 0) / product.reviews.length;
 
     await product.save();
 
-    res.json({
+    res.status(201).json({
       success: true,
       message: 'Review added successfully'
     });
   } catch (error) {
-    console.error('Add review error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error adding review'
-    });
-  }
-});
-
-// @route   GET /api/products/meta/categories
-// @desc    Get all categories
-// @access  Public
-router.get('/meta/categories', async (req, res) => {
-  try {
-    const categories = await Product.distinct('category', { isActive: true });
-    const brands = await Product.distinct('brand', { isActive: true });
-    
-    res.json({
-      success: true,
-      data: {
-        categories,
-        brands: brands.filter(brand => brand) // Remove null/empty brands
-      }
-    });
-  } catch (error) {
-    console.error('Get categories error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching categories'
+      message: 'Server error'
     });
   }
 });
@@ -201,22 +186,46 @@ router.get('/featured/list', async (req, res) => {
     const { limit = 8 } = req.query;
     
     const products = await Product.find({ 
-      isFeatured: true, 
-      isActive: true 
+      isActive: true, 
+      isFeatured: true 
     })
-    .limit(Number(limit))
-    .select('-reviews')
-    .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .limit(Number(limit))
+      .select('-reviews');
 
     res.json({
       success: true,
       data: products
     });
   } catch (error) {
-    console.error('Get featured products error:', error);
+    console.error(error);
     res.status(500).json({
       success: false,
-      message: 'Error fetching featured products'
+      message: 'Server error'
+    });
+  }
+});
+
+// @route   GET /api/products/meta/categories
+// @desc    Get all categories and brands
+// @access  Public
+router.get('/meta/categories', async (req, res) => {
+  try {
+    const categories = await Product.distinct('category', { isActive: true });
+    const brands = await Product.distinct('brand', { isActive: true });
+
+    res.json({
+      success: true,
+      data: {
+        categories,
+        brands
+      }
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
     });
   }
 });
